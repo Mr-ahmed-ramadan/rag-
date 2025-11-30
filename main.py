@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.1.0",  # Updated version
+    version="2.2.0",  # Updated version
     lifespan=lifespan,
 )
 
@@ -123,17 +123,28 @@ async def health_check():
     # Test vector store availability
     vector_store_available = False
     vector_store_error = None
+    vector_store_debug = {}
+    
     try:
+        # First check with static method (no instance needed)
+        static_check = VectorStore.check_available()
+        vector_store_debug["static_check"] = static_check
+        
+        # Also try instance method
         vs = get_vector_store()
-        vector_store_available = vs.is_available()
+        instance_check = vs.is_available()
+        vector_store_debug["instance_check"] = instance_check
+        
+        vector_store_available = static_check and instance_check
     except Exception as e:
-        vector_store_error = str(e)
+        vector_store_error = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"Vector store check failed: {vector_store_error}")
     
     return {
         "status": "healthy",
-        "code_version": "2.1.0",  # Updated version to verify deployment
+        "code_version": "2.2.0",  # Updated version to verify deployment
         "services": {
-            "docling": True,  # Always available after install
+            "docling": True,
             "vector_store": vector_store_available,
         },
         "environment": {
@@ -146,6 +157,7 @@ async def health_check():
         },
         "debug": {
             "vector_store_error": vector_store_error,
+            "vector_store_debug": vector_store_debug,
         }
     }
 
@@ -180,7 +192,7 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.1.0",  # To verify deployment
+        "code_version": "2.2.0",  # To verify deployment
     }
 
 
