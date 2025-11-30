@@ -63,7 +63,7 @@ async def warm_up_docling():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
-    logger.info("Starting Knowledge Extraction Backend v2.5.0...")
+    logger.info("Starting Knowledge Extraction Backend v2.6.0...")
     logger.info(f"UPSTASH_SEARCH_REST_URL set: {bool(os.getenv('UPSTASH_SEARCH_REST_URL'))}")
     logger.info(f"UPSTASH_SEARCH_REST_TOKEN set: {bool(os.getenv('UPSTASH_SEARCH_REST_TOKEN'))}")
     
@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.5.0",  # Updated version
+    version="2.6.0",
     lifespan=lifespan,
 )
 
@@ -154,10 +154,10 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "code_version": "2.5.0",  # Updated version
+        "code_version": "2.6.0",
         "services": {
             "docling": True,
-            "docling_ready": docling_ready,  # Show warm-up status
+            "docling_ready": docling_ready,
             "vector_store": vector_store_available,
         },
         "environment": {
@@ -204,7 +204,7 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.5.0",
+        "code_version": "2.6.0",
         "docling_ready": docling_ready,
     }
 
@@ -372,57 +372,49 @@ async def test_process_simple(request: ProcessRequest):
         }
 
 
-@app.post("/process", response_model=ProcessResponse)
-async def process_document(request: ProcessRequest, background_tasks: BackgroundTasks):
-    """Process a document and store in vector database"""
-    document_id = request.document_id
-    
-    processing_status[document_id] = {
-        "status": "processing",
-        "progress": 0,
-        "chunk_count": None,
-        "error": None,
-    }
-    
+async def process_document_background(document_id: str, blob_url: str, filename: Optional[str] = None):
+    """Process document in background - called asynchronously"""
     try:
-        logger.info(f"[{document_id}] Starting document processing")
+        logger.info(f"[{document_id}] Background processing started")
         
-        logger.info(f"[{document_id}] Loading processor...")
-        proc = get_processor()
-        logger.info(f"[{document_id}] Processor loaded, available: {proc.is_available()}")
-        
-        logger.info(f"[{document_id}] Loading vector store...")
-        vs = get_vector_store()
-        logger.info(f"[{document_id}] Vector store loaded, available: {vs.is_available()}")
-        
-        logger.info(f"[{document_id}] Downloading from {request.blob_url}")
         processing_status[document_id]["progress"] = 10
         
+        # Download
+        logger.info(f"[{document_id}] Downloading from {blob_url}")
         async with httpx.AsyncClient(timeout=180.0) as client:
-            response = await client.get(request.blob_url)
+            response = await client.get(blob_url)
             response.raise_for_status()
             content = response.content
         
         logger.info(f"[{document_id}] Downloaded {len(content)} bytes")
+        processing_status[document_id]["progress"] = 20
         
-        file_ext = request.blob_url.split(".")[-1].lower().split("?")[0]
+        # Get file extension
+        file_ext = blob_url.split(".")[-1].lower().split("?")[0]
         
+        # Process with Docling (this is the slow part)
         logger.info(f"[{document_id}] Processing with Docling (ext: {file_ext})")
         processing_status[document_id]["progress"] = 30
         
-        extracted = proc.process(content, file_ext, document_id)
+        proc = get_processor()
+        extracted = await asyncio.get_event_loop().run_in_executor(
+            None, proc.process, content, file_ext, document_id
+        )
+        
         logger.info(f"[{document_id}] Docling processing complete")
+        processing_status[document_id]["progress"] = 60
         
+        # Chunk
         logger.info(f"[{document_id}] Chunking document")
-        processing_status[document_id]["progress"] = 50
-        
         chunks = proc.chunk(extracted, document_id)
         logger.info(f"[{document_id}] Created {len(chunks)} chunks")
-        
-        logger.info(f"[{document_id}] Storing in Upstash Search")
         processing_status[document_id]["progress"] = 70
         
-        filename = request.filename or extracted["metadata"].get("title", "Unknown")
+        # Store in vector DB
+        logger.info(f"[{document_id}] Storing in Upstash Search")
+        vs = get_vector_store()
+        
+        final_filename = filename or extracted["metadata"].get("title", "Unknown")
         
         ids = [chunk["id"] for chunk in chunks]
         contents = [chunk["content"] for chunk in chunks]
@@ -430,7 +422,7 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         
         for chunk in chunks:
             meta = chunk["metadata"].copy()
-            meta["filename"] = filename
+            meta["filename"] = final_filename
             meta["document_id"] = document_id
             metadata_list.append(meta)
         
@@ -438,6 +430,7 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         
         processing_status[document_id]["progress"] = 90
         
+        # Mark as ready
         processing_status[document_id] = {
             "status": "ready",
             "progress": 100,
@@ -447,22 +440,46 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         
         logger.info(f"[{document_id}] Processing complete: {len(chunks)} chunks stored")
         
-        return ProcessResponse(
-            success=True,
-            document_id=document_id,
-            chunk_count=len(chunks),
-            message="Document processed successfully",
-        )
-        
     except Exception as e:
-        logger.error(f"[{document_id}] Error: {str(e)}", exc_info=True)
+        logger.error(f"[{document_id}] Background processing error: {str(e)}", exc_info=True)
         processing_status[document_id] = {
             "status": "error",
             "progress": 0,
             "chunk_count": None,
             "error": str(e),
         }
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/process")
+async def process_document(request: ProcessRequest, background_tasks: BackgroundTasks):
+    """Start document processing in background - returns immediately"""
+    document_id = request.document_id
+    
+    # Initialize status
+    processing_status[document_id] = {
+        "status": "processing",
+        "progress": 0,
+        "chunk_count": None,
+        "error": None,
+    }
+    
+    # Add to background tasks - this returns immediately
+    background_tasks.add_task(
+        process_document_background,
+        document_id,
+        request.blob_url,
+        request.filename
+    )
+    
+    logger.info(f"[{document_id}] Processing started in background")
+    
+    # Return immediately with "accepted" status
+    return {
+        "success": True,
+        "document_id": document_id,
+        "status": "processing",
+        "message": "Document processing started. Poll /status/{document_id} for progress.",
+    }
 
 
 @app.get("/status/{document_id}", response_model=StatusResponse)
