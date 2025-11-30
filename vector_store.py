@@ -1,134 +1,211 @@
 """
-Upstash Vector store integration
+Upstash Search/Vector store integration
+Uses Upstash's built-in embedding models - no external API key needed!
 """
 
 import os
 import logging
+import httpx
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from upstash_vector import Index
-    UPSTASH_AVAILABLE = True
-except ImportError:
-    UPSTASH_AVAILABLE = False
-    logger.warning("upstash-vector not installed")
-
 
 class VectorStore:
-    """Upstash Vector store for embeddings"""
+    """Upstash Vector/Search store with built-in embeddings"""
     
     def __init__(self):
-        self._index = None
+        self._url = None
+        self._token = None
     
-    def _get_index(self) -> "Index":
-        """Get or create Upstash Vector index"""
-        if self._index is None:
-            if not UPSTASH_AVAILABLE:
-                raise RuntimeError("upstash-vector not installed")
-            
-            url = os.getenv("UPSTASH_VECTOR_REST_URL")
-            token = os.getenv("UPSTASH_VECTOR_REST_TOKEN")
-            
-            if not url or not token:
-                raise RuntimeError("UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN must be set")
-            
-            self._index = Index(url=url, token=token)
+    def _get_credentials(self):
+        """Get Upstash credentials - always check fresh from environment"""
+        url = os.getenv("UPSTASH_SEARCH_REST_URL") or os.getenv("UPSTASH_VECTOR_REST_URL")
+        token = os.getenv("UPSTASH_SEARCH_REST_TOKEN") or os.getenv("UPSTASH_VECTOR_REST_TOKEN")
         
-        return self._index
+        if not url or not token:
+            raise RuntimeError(
+                "UPSTASH_SEARCH_REST_URL/UPSTASH_SEARCH_REST_TOKEN or "
+                "UPSTASH_VECTOR_REST_URL/UPSTASH_VECTOR_REST_TOKEN must be set"
+            )
+        
+        self._url = url
+        self._token = token
+        return self._url, self._token
+    
+    @staticmethod
+    def check_available() -> bool:
+        """
+        Static method to check if vector store is available without creating instance.
+        Checks environment variables directly.
+        """
+        url = os.getenv("UPSTASH_SEARCH_REST_URL") or os.getenv("UPSTASH_VECTOR_REST_URL")
+        token = os.getenv("UPSTASH_SEARCH_REST_TOKEN") or os.getenv("UPSTASH_VECTOR_REST_TOKEN")
+        return bool(url and token)
     
     def is_available(self) -> bool:
         """Check if vector store is available"""
         try:
-            self._get_index()
+            self._get_credentials()
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Vector store not available: {e}")
             return False
     
     def upsert(
         self,
         ids: List[str],
-        embeddings: List[List[float]],
+        contents: List[str],
         metadata: List[Dict[str, Any]],
     ) -> None:
         """
-        Upsert vectors into the index
+        Upsert documents into the index using Upstash's built-in embeddings
         
         Args:
-            ids: Vector IDs
-            embeddings: Embedding vectors
-            metadata: Metadata for each vector
+            ids: Document IDs
+            contents: Text content (will be embedded by Upstash)
+            metadata: Metadata for each document
         """
-        index = self._get_index()
+        url, token = self._get_credentials()
         
-        # Prepare vectors
-        vectors = [
+        # Prepare data for upsert-data endpoint (auto-embedding)
+        data = [
             {
                 "id": id_,
-                "vector": embedding,
-                "metadata": meta,
+                "data": content,
+                "metadata": {**meta, "content": content},  # Store content in metadata too
             }
-            for id_, embedding, meta in zip(ids, embeddings, metadata)
+            for id_, content, meta in zip(ids, contents, metadata)
         ]
         
         # Upsert in batches of 100
         batch_size = 100
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            index.upsert(vectors=batch)
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i + batch_size]
+            
+            response = httpx.post(
+                f"{url}/upsert-data",
+                headers={"Authorization": f"Bearer {token}"},
+                json=batch,
+                timeout=60.0,
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Upsert failed: {response.text}")
+                raise RuntimeError(f"Upsert failed: {response.text}")
         
-        logger.info(f"Upserted {len(vectors)} vectors")
+        logger.info(f"Upserted {len(data)} documents with auto-embedding")
     
     def query(
         self,
-        embedding: List[float],
+        query_text: str,
         top_k: int = 5,
         filter_: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Query vectors by similarity
+        Query documents by semantic similarity using Upstash's built-in embeddings
         
         Args:
-            embedding: Query embedding
+            query_text: Query string (will be embedded by Upstash)
             top_k: Number of results
             filter_: Metadata filter
             
         Returns:
             List of results with scores
         """
-        index = self._get_index()
+        url, token = self._get_credentials()
         
-        results = index.query(
-            vector=embedding,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter_,
+        request_body = {
+            "data": query_text,
+            "topK": top_k,
+            "includeMetadata": True,
+            "includeData": True,
+        }
+        
+        if filter_:
+            request_body["filter"] = filter_
+        
+        response = httpx.post(
+            f"{url}/query-data",
+            headers={"Authorization": f"Bearer {token}"},
+            json=request_body,
+            timeout=30.0,
         )
+        
+        if response.status_code != 200:
+            logger.error(f"Query failed: {response.text}")
+            raise RuntimeError(f"Query failed: {response.text}")
+        
+        results = response.json()
+        
+        # Handle both response formats
+        if isinstance(results, dict) and "result" in results:
+            results = results["result"]
         
         return [
             {
-                "id": r.id,
-                "score": r.score,
-                "metadata": r.metadata,
+                "id": r.get("id"),
+                "score": r.get("score", 0),
+                "metadata": r.get("metadata", {}),
+                "data": r.get("data", ""),
             }
             for r in results
         ]
     
+    def delete_by_ids(self, ids: List[str]) -> None:
+        """
+        Delete documents by IDs
+        
+        Args:
+            ids: List of document IDs to delete
+        """
+        url, token = self._get_credentials()
+        
+        response = httpx.post(
+            f"{url}/delete",
+            headers={"Authorization": f"Bearer {token}"},
+            json=ids,
+            timeout=30.0,
+        )
+        
+        if response.status_code != 200:
+            logger.warning(f"Delete failed: {response.text}")
+        else:
+            logger.info(f"Deleted {len(ids)} documents")
+    
     def delete_by_prefix(self, prefix: str) -> None:
         """
-        Delete vectors by ID prefix
+        Delete documents by ID prefix
+        Note: This queries first to find matching IDs, then deletes
         
         Args:
             prefix: ID prefix to match
         """
-        index = self._get_index()
+        url, token = self._get_credentials()
         
-        # Query to find matching IDs
-        # Note: This is a simple implementation
-        # For production, consider using Upstash's delete by filter
         try:
-            index.delete(ids=[prefix], delete_all=False)
-            logger.info(f"Deleted vectors with prefix: {prefix}")
+            # Use range query to find IDs with prefix
+            response = httpx.post(
+                f"{url}/range",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "cursor": "0",
+                    "limit": 1000,
+                    "prefix": prefix,
+                },
+                timeout=30.0,
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "vectors" in data:
+                    ids_to_delete = [v["id"] for v in data["vectors"]]
+                    if ids_to_delete:
+                        self.delete_by_ids(ids_to_delete)
+                        return
+            
+            # Fallback: try direct delete
+            self.delete_by_ids([prefix])
+            
         except Exception as e:
             logger.warning(f"Delete by prefix failed: {e}")
