@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.0.0",  # Updated version
+    version="2.1.0",  # Updated version
     lifespan=lifespan,
 )
 
@@ -110,16 +110,42 @@ class SearchResponse(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint - lightweight, no heavy imports"""
-    upstash_url_set = bool(os.getenv('UPSTASH_SEARCH_REST_URL') or os.getenv('UPSTASH_VECTOR_REST_URL'))
-    upstash_token_set = bool(os.getenv('UPSTASH_SEARCH_REST_TOKEN') or os.getenv('UPSTASH_VECTOR_REST_TOKEN'))
+    """Health check endpoint with full diagnostics"""
+    # Check environment variables
+    search_url = os.getenv('UPSTASH_SEARCH_REST_URL', '')
+    search_token = os.getenv('UPSTASH_SEARCH_REST_TOKEN', '')
+    vector_url = os.getenv('UPSTASH_VECTOR_REST_URL', '')
+    vector_token = os.getenv('UPSTASH_VECTOR_REST_TOKEN', '')
+    
+    upstash_url_set = bool(search_url or vector_url)
+    upstash_token_set = bool(search_token or vector_token)
+    
+    # Test vector store availability
+    vector_store_available = False
+    vector_store_error = None
+    try:
+        vs = get_vector_store()
+        vector_store_available = vs.is_available()
+    except Exception as e:
+        vector_store_error = str(e)
     
     return {
         "status": "healthy",
-        "service": "docling-processor",
+        "code_version": "2.1.0",  # Updated version to verify deployment
+        "services": {
+            "docling": True,  # Always available after install
+            "vector_store": vector_store_available,
+        },
         "environment": {
-            "upstash_url_configured": upstash_url_set,
-            "upstash_token_configured": upstash_token_set,
+            "UPSTASH_SEARCH_REST_URL": bool(search_url),
+            "UPSTASH_SEARCH_REST_TOKEN": bool(search_token),
+            "UPSTASH_VECTOR_REST_URL": bool(vector_url),
+            "UPSTASH_VECTOR_REST_TOKEN": bool(vector_token),
+            "url_length": len(search_url or vector_url),
+            "token_length": len(search_token or vector_token),
+        },
+        "debug": {
+            "vector_store_error": vector_store_error,
         }
     }
 
@@ -154,7 +180,7 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.0.0",  # To verify deployment
+        "code_version": "2.1.0",  # To verify deployment
     }
 
 
