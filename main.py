@@ -21,6 +21,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from vector_store import VectorStore
+
 processor = None
 vector_store = None
 
@@ -36,7 +38,6 @@ def get_vector_store():
     """Lazy-load the vector store"""
     global vector_store
     if vector_store is None:
-        from vector_store import VectorStore
         vector_store = VectorStore()
     return vector_store
 
@@ -57,7 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.2.0",  # Updated version
+    version="2.3.0",  # Updated version
     lifespan=lifespan,
 )
 
@@ -126,7 +127,6 @@ async def health_check():
     vector_store_debug = {}
     
     try:
-        # First check with static method (no instance needed)
         static_check = VectorStore.check_available()
         vector_store_debug["static_check"] = static_check
         
@@ -142,7 +142,7 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "code_version": "2.2.0",  # Updated version to verify deployment
+        "code_version": "2.3.0",  # Updated version
         "services": {
             "docling": True,
             "vector_store": vector_store_available,
@@ -192,7 +192,7 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.2.0",  # To verify deployment
+        "code_version": "2.3.0",  # Updated version
     }
 
 
