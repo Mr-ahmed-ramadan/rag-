@@ -10,13 +10,16 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_INDEX_NAME = "knowledge-extractor"
+
 
 class VectorStore:
     """Upstash Vector/Search store with built-in embeddings"""
     
-    def __init__(self):
+    def __init__(self, index_name: str = DEFAULT_INDEX_NAME):
         self._url = None
         self._token = None
+        self._index_name = index_name
     
     def _get_credentials(self):
         """Get Upstash credentials - always check fresh from environment"""
@@ -83,8 +86,13 @@ class VectorStore:
         for i in range(0, len(data), batch_size):
             batch = data[i:i + batch_size]
             
+            # Try with namespace first (Upstash Vector style), fallback to index path (Upstash Search style)
+            upsert_url = f"{url}/upsert-data/{self._index_name}"
+            
+            logger.info(f"Upserting batch to: {upsert_url}")
+            
             response = httpx.post(
-                f"{url}/upsert-data",
+                upsert_url,
                 headers={"Authorization": f"Bearer {token}"},
                 json=batch,
                 timeout=60.0,
@@ -94,7 +102,7 @@ class VectorStore:
                 logger.error(f"Upsert failed: {response.text}")
                 raise RuntimeError(f"Upsert failed: {response.text}")
         
-        logger.info(f"Upserted {len(data)} documents with auto-embedding")
+        logger.info(f"Upserted {len(data)} documents with auto-embedding to index '{self._index_name}'")
     
     def query(
         self,
@@ -125,8 +133,12 @@ class VectorStore:
         if filter_:
             request_body["filter"] = filter_
         
+        query_url = f"{url}/query-data/{self._index_name}"
+        
+        logger.info(f"Querying: {query_url}")
+        
         response = httpx.post(
-            f"{url}/query-data",
+            query_url,
             headers={"Authorization": f"Bearer {token}"},
             json=request_body,
             timeout=30.0,
@@ -161,8 +173,10 @@ class VectorStore:
         """
         url, token = self._get_credentials()
         
+        delete_url = f"{url}/delete/{self._index_name}"
+        
         response = httpx.post(
-            f"{url}/delete",
+            delete_url,
             headers={"Authorization": f"Bearer {token}"},
             json=ids,
             timeout=30.0,
@@ -171,7 +185,7 @@ class VectorStore:
         if response.status_code != 200:
             logger.warning(f"Delete failed: {response.text}")
         else:
-            logger.info(f"Deleted {len(ids)} documents")
+            logger.info(f"Deleted {len(ids)} documents from index '{self._index_name}'")
     
     def delete_by_prefix(self, prefix: str) -> None:
         """
@@ -184,9 +198,11 @@ class VectorStore:
         url, token = self._get_credentials()
         
         try:
+            range_url = f"{url}/range/{self._index_name}"
+            
             # Use range query to find IDs with prefix
             response = httpx.post(
-                f"{url}/range",
+                range_url,
                 headers={"Authorization": f"Bearer {token}"},
                 json={
                     "cursor": "0",
