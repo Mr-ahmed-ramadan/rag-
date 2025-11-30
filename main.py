@@ -5,6 +5,7 @@ FastAPI server for document processing using IBM Docling
 
 import os
 import logging
+import asyncio
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -25,6 +26,7 @@ from vector_store import VectorStore
 
 processor = None
 vector_store = None
+docling_ready = False
 
 def get_processor():
     """Lazy-load the document processor"""
@@ -45,12 +47,28 @@ def get_vector_store():
 processing_status = {}
 
 
+async def warm_up_docling():
+    """Pre-initialize Docling in background to avoid timeout on first request"""
+    global docling_ready
+    try:
+        logger.info("Warming up Docling...")
+        proc = get_processor()
+        docling_ready = proc.is_available()
+        logger.info(f"Docling warm-up complete: available={docling_ready}")
+    except Exception as e:
+        logger.error(f"Docling warm-up failed: {e}")
+        docling_ready = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
-    logger.info("Starting Knowledge Extraction Backend...")
+    logger.info("Starting Knowledge Extraction Backend v2.5.0...")
     logger.info(f"UPSTASH_SEARCH_REST_URL set: {bool(os.getenv('UPSTASH_SEARCH_REST_URL'))}")
     logger.info(f"UPSTASH_SEARCH_REST_TOKEN set: {bool(os.getenv('UPSTASH_SEARCH_REST_TOKEN'))}")
+    
+    asyncio.create_task(warm_up_docling())
+    
     yield
     logger.info("Shutting down...")
 
@@ -58,7 +76,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.4.0",  # Updated version
+    version="2.5.0",  # Updated version
     lifespan=lifespan,
 )
 
@@ -112,16 +130,11 @@ class SearchResponse(BaseModel):
 @app.get("/health")
 async def health_check():
     """Health check endpoint with full diagnostics"""
-    # Check environment variables
     search_url = os.getenv('UPSTASH_SEARCH_REST_URL', '')
     search_token = os.getenv('UPSTASH_SEARCH_REST_TOKEN', '')
     vector_url = os.getenv('UPSTASH_VECTOR_REST_URL', '')
     vector_token = os.getenv('UPSTASH_VECTOR_REST_TOKEN', '')
     
-    upstash_url_set = bool(search_url or vector_url)
-    upstash_token_set = bool(search_token or vector_token)
-    
-    # Test vector store availability
     vector_store_available = False
     vector_store_error = None
     vector_store_debug = {}
@@ -130,7 +143,6 @@ async def health_check():
         static_check = VectorStore.check_available()
         vector_store_debug["static_check"] = static_check
         
-        # Also try instance method
         vs = get_vector_store()
         instance_check = vs.is_available()
         vector_store_debug["instance_check"] = instance_check
@@ -142,9 +154,10 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "code_version": "2.4.0",  # Updated version
+        "code_version": "2.5.0",  # Updated version
         "services": {
             "docling": True,
+            "docling_ready": docling_ready,  # Show warm-up status
             "vector_store": vector_store_available,
         },
         "environment": {
@@ -164,13 +177,12 @@ async def health_check():
 
 @app.get("/debug/env")
 async def debug_env():
-    """Debug endpoint to check environment variables (redacted for security)"""
+    """Debug endpoint to check environment variables"""
     search_url = os.getenv('UPSTASH_SEARCH_REST_URL', '')
     search_token = os.getenv('UPSTASH_SEARCH_REST_TOKEN', '')
     vector_url = os.getenv('UPSTASH_VECTOR_REST_URL', '')
     vector_token = os.getenv('UPSTASH_VECTOR_REST_TOKEN', '')
     
-    # Get all env var names (not values for security)
     all_env_keys = sorted([k for k in os.environ.keys() if 'UPSTASH' in k.upper()])
     
     return {
@@ -192,7 +204,8 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.4.0",  # Updated version
+        "code_version": "2.5.0",
+        "docling_ready": docling_ready,
     }
 
 
@@ -205,6 +218,7 @@ async def readiness_check():
         return {
             "ready": True,
             "docling_available": proc.is_available(),
+            "docling_ready": docling_ready,
             "vector_store_available": vs.is_available(),
         }
     except Exception as e:
@@ -212,7 +226,6 @@ async def readiness_check():
         return {"ready": False, "error": str(e)}
 
 
-# Test endpoint to check if Docling can load
 @app.get("/test/docling")
 async def test_docling():
     """Test if Docling can be loaded"""
@@ -225,6 +238,7 @@ async def test_docling():
         return {
             "success": True,
             "docling_available": available,
+            "docling_ready": docling_ready,
             "message": "Docling loaded successfully"
         }
     except Exception as e:
@@ -237,14 +251,96 @@ async def test_docling():
         }
 
 
-# Test endpoint for simple text processing (no Docling)
+@app.post("/test/process-full")
+async def test_process_full(request: ProcessRequest):
+    """Test full processing pipeline with detailed logging"""
+    steps = []
+    
+    try:
+        # Step 1: Download
+        steps.append({"step": "download_start", "status": "running"})
+        logger.info(f"[TEST] Step 1: Downloading {request.blob_url}")
+        
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.get(request.blob_url)
+            response.raise_for_status()
+            content = response.content
+        
+        steps[-1]["status"] = "success"
+        steps[-1]["bytes"] = len(content)
+        logger.info(f"[TEST] Step 1 complete: {len(content)} bytes")
+        
+        # Step 2: Get file extension
+        steps.append({"step": "parse_extension", "status": "running"})
+        file_ext = request.blob_url.split(".")[-1].lower().split("?")[0]
+        steps[-1]["status"] = "success"
+        steps[-1]["extension"] = file_ext
+        logger.info(f"[TEST] Step 2 complete: extension={file_ext}")
+        
+        # Step 3: Initialize processor
+        steps.append({"step": "init_processor", "status": "running"})
+        logger.info("[TEST] Step 3: Initializing processor...")
+        proc = get_processor()
+        steps[-1]["status"] = "success"
+        steps[-1]["available"] = proc.is_available()
+        logger.info(f"[TEST] Step 3 complete: processor available={proc.is_available()}")
+        
+        # Step 4: Process with Docling
+        steps.append({"step": "docling_process", "status": "running"})
+        logger.info("[TEST] Step 4: Processing with Docling...")
+        extracted = proc.process(content, file_ext, request.document_id)
+        steps[-1]["status"] = "success"
+        steps[-1]["content_length"] = len(extracted.get("content", ""))
+        logger.info(f"[TEST] Step 4 complete: extracted {len(extracted.get('content', ''))} chars")
+        
+        # Step 5: Chunk
+        steps.append({"step": "chunking", "status": "running"})
+        logger.info("[TEST] Step 5: Chunking...")
+        chunks = proc.chunk(extracted, request.document_id)
+        steps[-1]["status"] = "success"
+        steps[-1]["chunk_count"] = len(chunks)
+        logger.info(f"[TEST] Step 5 complete: {len(chunks)} chunks")
+        
+        # Step 6: Store in vector DB
+        steps.append({"step": "vector_store", "status": "running"})
+        logger.info("[TEST] Step 6: Storing in vector DB...")
+        vs = get_vector_store()
+        
+        ids = [chunk["id"] for chunk in chunks]
+        contents = [chunk["content"] for chunk in chunks]
+        metadata_list = [chunk["metadata"] for chunk in chunks]
+        
+        vs.upsert(ids=ids, contents=contents, metadata=metadata_list)
+        steps[-1]["status"] = "success"
+        logger.info("[TEST] Step 6 complete: stored in vector DB")
+        
+        return {
+            "success": True,
+            "document_id": request.document_id,
+            "chunk_count": len(chunks),
+            "steps": steps,
+            "message": "Full processing test passed!"
+        }
+        
+    except Exception as e:
+        logger.error(f"[TEST] Error: {str(e)}", exc_info=True)
+        if steps and steps[-1]["status"] == "running":
+            steps[-1]["status"] = "error"
+            steps[-1]["error"] = str(e)
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "steps": steps,
+        }
+
+
 @app.post("/test/process-simple")
 async def test_process_simple(request: ProcessRequest):
     """Test processing without Docling - just download and store text"""
     try:
         logger.info(f"Simple test: downloading {request.blob_url}")
         
-        # Download document
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(request.blob_url)
             response.raise_for_status()
@@ -252,10 +348,8 @@ async def test_process_simple(request: ProcessRequest):
         
         logger.info(f"Downloaded {len(content)} bytes")
         
-        # Create simple chunks without Docling
         text_content = f"Document {request.document_id}: {len(content)} bytes downloaded successfully"
         
-        # Test vector store
         vs = get_vector_store()
         vs.upsert(
             ids=[f"{request.document_id}_test"],
@@ -280,12 +374,9 @@ async def test_process_simple(request: ProcessRequest):
 
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(request: ProcessRequest, background_tasks: BackgroundTasks):
-    """
-    Process a document and store in vector database
-    """
+    """Process a document and store in vector database"""
     document_id = request.document_id
     
-    # Initialize status
     processing_status[document_id] = {
         "status": "processing",
         "progress": 0,
@@ -294,7 +385,6 @@ async def process_document(request: ProcessRequest, background_tasks: Background
     }
     
     try:
-        # More detailed logging
         logger.info(f"[{document_id}] Starting document processing")
         
         logger.info(f"[{document_id}] Loading processor...")
@@ -305,7 +395,6 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         vs = get_vector_store()
         logger.info(f"[{document_id}] Vector store loaded, available: {vs.is_available()}")
         
-        # Download document
         logger.info(f"[{document_id}] Downloading from {request.blob_url}")
         processing_status[document_id]["progress"] = 10
         
@@ -316,17 +405,14 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         
         logger.info(f"[{document_id}] Downloaded {len(content)} bytes")
         
-        # Get file extension from URL
         file_ext = request.blob_url.split(".")[-1].lower().split("?")[0]
         
-        # Process with Docling
         logger.info(f"[{document_id}] Processing with Docling (ext: {file_ext})")
         processing_status[document_id]["progress"] = 30
         
         extracted = proc.process(content, file_ext, document_id)
         logger.info(f"[{document_id}] Docling processing complete")
         
-        # Chunk content
         logger.info(f"[{document_id}] Chunking document")
         processing_status[document_id]["progress"] = 50
         
@@ -336,10 +422,8 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         logger.info(f"[{document_id}] Storing in Upstash Search")
         processing_status[document_id]["progress"] = 70
         
-        # Get filename from request or extracted metadata
         filename = request.filename or extracted["metadata"].get("title", "Unknown")
         
-        # Prepare data for vector store
         ids = [chunk["id"] for chunk in chunks]
         contents = [chunk["content"] for chunk in chunks]
         metadata_list = []
@@ -350,16 +434,10 @@ async def process_document(request: ProcessRequest, background_tasks: Background
             meta["document_id"] = document_id
             metadata_list.append(meta)
         
-        # Store in vector database
-        vs.upsert(
-            ids=ids,
-            contents=contents,
-            metadata=metadata_list,
-        )
+        vs.upsert(ids=ids, contents=contents, metadata=metadata_list)
         
         processing_status[document_id]["progress"] = 90
         
-        # Update status
         processing_status[document_id] = {
             "status": "ready",
             "progress": 100,
@@ -394,10 +472,7 @@ async def get_status(document_id: str):
         raise HTTPException(status_code=404, detail="Document not found")
     
     status = processing_status[document_id]
-    return StatusResponse(
-        document_id=document_id,
-        **status,
-    )
+    return StatusResponse(document_id=document_id, **status)
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -405,10 +480,7 @@ async def search_documents(request: SearchRequest):
     """Search for relevant document chunks"""
     try:
         vs = get_vector_store()
-        results = vs.query(
-            query_text=request.query,
-            top_k=request.top_k,
-        )
+        results = vs.query(query_text=request.query, top_k=request.top_k)
         
         return SearchResponse(
             results=[
@@ -431,11 +503,7 @@ async def get_chunk(chunk_id: str):
     """Get full chunk content for a citation"""
     try:
         vs = get_vector_store()
-        results = vs.query(
-            query_text="",
-            top_k=1,
-            filter_={"id": chunk_id},
-        )
+        results = vs.query(query_text="", top_k=1, filter_={"id": chunk_id})
         
         if results:
             return {
