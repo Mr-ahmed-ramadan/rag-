@@ -63,7 +63,7 @@ async def warm_up_docling():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
-    logger.info("Starting Knowledge Extraction Backend v2.6.0...")
+    logger.info("Starting Knowledge Extraction Backend v2.7.0...")
     logger.info(f"UPSTASH_SEARCH_REST_URL set: {bool(os.getenv('UPSTASH_SEARCH_REST_URL'))}")
     logger.info(f"UPSTASH_SEARCH_REST_TOKEN set: {bool(os.getenv('UPSTASH_SEARCH_REST_TOKEN'))}")
     
@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan,
 )
 
@@ -154,7 +154,7 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "code_version": "2.6.0",
+        "code_version": "2.7.0",
         "services": {
             "docling": True,
             "docling_ready": docling_ready,
@@ -204,7 +204,7 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.6.0",
+        "code_version": "2.7.0",
         "docling_ready": docling_ready,
     }
 
