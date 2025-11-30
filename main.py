@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Extraction Backend",
     description="Document processing API using IBM Docling",
-    version="2.3.0",  # Updated version
+    version="2.4.0",  # Updated version
     lifespan=lifespan,
 )
 
@@ -142,7 +142,7 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "code_version": "2.3.0",  # Updated version
+        "code_version": "2.4.0",  # Updated version
         "services": {
             "docling": True,
             "vector_store": vector_store_available,
@@ -192,7 +192,7 @@ async def debug_env():
             "length": len(vector_token),
         },
         "all_upstash_env_keys": all_env_keys,
-        "code_version": "2.3.0",  # Updated version
+        "code_version": "2.4.0",  # Updated version
     }
 
 
@@ -212,6 +212,72 @@ async def readiness_check():
         return {"ready": False, "error": str(e)}
 
 
+# Test endpoint to check if Docling can load
+@app.get("/test/docling")
+async def test_docling():
+    """Test if Docling can be loaded"""
+    try:
+        logger.info("Testing Docling load...")
+        from processor import DocumentProcessor
+        proc = DocumentProcessor()
+        available = proc.is_available()
+        logger.info(f"Docling loaded successfully, available: {available}")
+        return {
+            "success": True,
+            "docling_available": available,
+            "message": "Docling loaded successfully"
+        }
+    except Exception as e:
+        logger.error(f"Docling load failed: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "docling_available": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+
+# Test endpoint for simple text processing (no Docling)
+@app.post("/test/process-simple")
+async def test_process_simple(request: ProcessRequest):
+    """Test processing without Docling - just download and store text"""
+    try:
+        logger.info(f"Simple test: downloading {request.blob_url}")
+        
+        # Download document
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(request.blob_url)
+            response.raise_for_status()
+            content = response.content
+        
+        logger.info(f"Downloaded {len(content)} bytes")
+        
+        # Create simple chunks without Docling
+        text_content = f"Document {request.document_id}: {len(content)} bytes downloaded successfully"
+        
+        # Test vector store
+        vs = get_vector_store()
+        vs.upsert(
+            ids=[f"{request.document_id}_test"],
+            contents=[text_content],
+            metadata=[{"document_id": request.document_id, "test": True}]
+        )
+        
+        return {
+            "success": True,
+            "document_id": request.document_id,
+            "bytes_downloaded": len(content),
+            "message": "Simple test passed - download and vector store work"
+        }
+    except Exception as e:
+        logger.error(f"Simple test failed: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(request: ProcessRequest, background_tasks: BackgroundTasks):
     """
@@ -228,36 +294,46 @@ async def process_document(request: ProcessRequest, background_tasks: Background
     }
     
     try:
+        # More detailed logging
+        logger.info(f"[{document_id}] Starting document processing")
+        
+        logger.info(f"[{document_id}] Loading processor...")
         proc = get_processor()
+        logger.info(f"[{document_id}] Processor loaded, available: {proc.is_available()}")
+        
+        logger.info(f"[{document_id}] Loading vector store...")
         vs = get_vector_store()
+        logger.info(f"[{document_id}] Vector store loaded, available: {vs.is_available()}")
         
         # Download document
-        logger.info(f"Downloading document {document_id} from {request.blob_url}")
+        logger.info(f"[{document_id}] Downloading from {request.blob_url}")
         processing_status[document_id]["progress"] = 10
         
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.get(request.blob_url)
             response.raise_for_status()
             content = response.content
         
-        logger.info(f"Downloaded {len(content)} bytes")
+        logger.info(f"[{document_id}] Downloaded {len(content)} bytes")
         
         # Get file extension from URL
         file_ext = request.blob_url.split(".")[-1].lower().split("?")[0]
         
         # Process with Docling
-        logger.info(f"Processing document {document_id} with Docling (ext: {file_ext})")
+        logger.info(f"[{document_id}] Processing with Docling (ext: {file_ext})")
         processing_status[document_id]["progress"] = 30
         
         extracted = proc.process(content, file_ext, document_id)
+        logger.info(f"[{document_id}] Docling processing complete")
         
         # Chunk content
-        logger.info(f"Chunking document {document_id}")
+        logger.info(f"[{document_id}] Chunking document")
         processing_status[document_id]["progress"] = 50
         
         chunks = proc.chunk(extracted, document_id)
+        logger.info(f"[{document_id}] Created {len(chunks)} chunks")
         
-        logger.info(f"Storing {len(chunks)} chunks in Upstash Search")
+        logger.info(f"[{document_id}] Storing in Upstash Search")
         processing_status[document_id]["progress"] = 70
         
         # Get filename from request or extracted metadata
@@ -291,7 +367,7 @@ async def process_document(request: ProcessRequest, background_tasks: Background
             "error": None,
         }
         
-        logger.info(f"Document {document_id} processed successfully: {len(chunks)} chunks")
+        logger.info(f"[{document_id}] Processing complete: {len(chunks)} chunks stored")
         
         return ProcessResponse(
             success=True,
@@ -301,7 +377,7 @@ async def process_document(request: ProcessRequest, background_tasks: Background
         )
         
     except Exception as e:
-        logger.error(f"Error processing document {document_id}: {str(e)}", exc_info=True)
+        logger.error(f"[{document_id}] Error: {str(e)}", exc_info=True)
         processing_status[document_id] = {
             "status": "error",
             "progress": 0,
